@@ -1,0 +1,538 @@
+<?php
+
+namespace App\Services\Workflow;
+
+use App\Enums\AccessLevel;
+use App\Enums\ArticleStatus;
+use App\Enums\NotificationType;
+use App\Enums\ReviewAction;
+use App\Http\Resources\ArticleResource;
+use App\Jobs\NotifySubscribersOfArticle;
+use App\Models\Article;
+use App\Models\ArticleReview;
+use App\Models\PublishingSchedule;
+use App\Models\ReporterCategoryAssignment;
+use App\Models\User;
+use App\Services\NotificationService;
+use App\Support\DateRange;
+use Carbon\CarbonInterface;
+use Closure;
+use Illuminate\Support\Carbon;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Gate;
+use Illuminate\Validation\ValidationException;
+use Symfony\Component\HttpKernel\Exception\AccessDeniedHttpException;
+
+/**
+ * The SINGLE writer of articles.status (Django apps.reporters.services.ArticleWorkflowService
+ * + apps.articles.transitions).
+ *
+ * Every named action (submit, startReview, ...) delegates to ONE private transition routine which, inside
+ * a DB transaction and under a row lock on the article: re-authorizes the actor against the fresh row,
+ * validates the transition against ArticleStatus::transitions(), applies the change, writes the
+ * ArticleReview audit row and creates the notifications. The author is never touched.
+ *
+ * changeStatus() is the generic entry point (used by the admin article PATCH): it maps the requested target
+ * status onto the matching named action, so it obeys exactly the same map, permissions and side effects.
+ * There is no "free move" outside the transition map.
+ */
+class ArticleWorkflowService
+{
+    /** ability => ArticlePolicy method */
+    private const POLICY = [
+        'submit' => 'submit',
+        'startReview' => 'startReview',
+        'requestChanges' => 'requestChanges',
+        'reject' => 'review',
+        'approve' => 'review',
+        'publish' => 'review',
+        'schedule' => 'review',
+        'cancelSchedule' => 'cancelSchedule',
+        'assignReporter' => 'assignReporter',
+    ];
+
+    /** ability => Django's 403 message */
+    private const DENIED = [
+        'submit' => "Only the article's author or assigned reporter may submit it for review.",
+        'startReview' => 'Only administrators can start a review.',
+        'requestChanges' => 'Only administrators can request changes.',
+        'reject' => "Only administrators or this article's assigned reporter can reject it.",
+        'approve' => "Only administrators or this article's assigned reporter can approve it.",
+        'publish' => "Only administrators or this article's assigned reporter can publish it.",
+        'schedule' => "Only administrators or this article's assigned reporter can schedule it.",
+        'cancelSchedule' => 'Only administrators can cancel a schedule.',
+        'assignReporter' => 'Only administrators can assign a reporter.',
+    ];
+
+    public function __construct(private readonly NotificationService $notifications) {}
+
+    // ------------------------------------------------------------------
+    // Authorization
+    // ------------------------------------------------------------------
+
+    /**
+     * Mirrors Django's layered checks: writer role -> object-level (author/assigned/admin) -> action rule.
+     *
+     * @throws AccessDeniedHttpException
+     */
+    public function authorize(?User $actor, Article $article, string $ability): void
+    {
+        if (! $actor || ! $actor->is_active || ! ($actor->isAdmin() || $actor->isReporter())) {
+            throw new AccessDeniedHttpException('Only reporters and administrators can create or modify articles.');
+        }
+        $isAdmin = $actor->isAdmin();
+        if (! $isAdmin && $article->author_id !== $actor->id && $article->assigned_reporter_id !== $actor->id) {
+            throw new AccessDeniedHttpException('You do not have permission to perform this action.');
+        }
+
+        $allowed = Gate::forUser($actor)->allows(self::POLICY[$ability], $article);
+        // A reviewer must not be the author (only an admin may act on their own article).
+        if ($allowed && self::POLICY[$ability] === 'review' && ! $isAdmin && $article->author_id === $actor->id) {
+            $allowed = false;
+        }
+        if (! $allowed) {
+            throw new AccessDeniedHttpException(self::DENIED[$ability]);
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // Named actions
+    // ------------------------------------------------------------------
+
+    /** DRAFT|CHANGES_REQUESTED -> SUBMITTED (RESUBMITTED review row when coming back from changes). */
+    public function submit(Article $article, User $actor): Article
+    {
+        return $this->transition($article, $actor, 'submit', ArticleStatus::SUBMITTED, function (Article $a, ArticleStatus $from) use ($actor) {
+            $resubmit = $from === ArticleStatus::CHANGES_REQUESTED;
+
+            return [
+                'action' => $resubmit ? ReviewAction::RESUBMITTED : ReviewAction::SUBMITTED,
+                'after' => function (Article $a) use ($actor, $resubmit) {
+                    $this->notifications->notifyAdmins(
+                        $resubmit ? NotificationType::ARTICLE_RESUBMITTED : NotificationType::ARTICLE_SUBMITTED,
+                        sprintf('Article "%s" was %s for review by %s.', $a->title, $resubmit ? 'resubmitted' : 'submitted', $actor->email),
+                        $a,
+                        $actor->id,
+                    );
+                },
+            ];
+        });
+    }
+
+    /** SUBMITTED -> UNDER_REVIEW (a DRAFT only when a reporter is already assigned). */
+    public function startReview(Article $article, User $actor): Article
+    {
+        return $this->transition($article, $actor, 'startReview', ArticleStatus::UNDER_REVIEW, function (Article $a, ArticleStatus $from) {
+            if ($from === ArticleStatus::DRAFT && $a->assigned_reporter_id === null) {
+                throw WorkflowException::field(
+                    'assigned_reporter',
+                    "Assign a reporter before starting review on a Draft article. Use the 'Assign a reporter for review' action instead.",
+                );
+            }
+
+            return ['action' => ReviewAction::STARTED_REVIEW];
+        });
+    }
+
+    public function requestChanges(Article $article, User $actor, string $reason): Article
+    {
+        $reason = $this->cleanReason($reason);
+
+        return $this->transition($article, $actor, 'requestChanges', ArticleStatus::CHANGES_REQUESTED, fn () => [
+            'action' => ReviewAction::CHANGES_REQUESTED,
+            'reason' => $reason,
+            'after' => fn (Article $a) => $this->notifications->notify(
+                $a->author,
+                NotificationType::CHANGES_REQUESTED,
+                sprintf('Changes were requested on your article "%s": %s', $a->title, $reason),
+                $a,
+            ),
+        ]);
+    }
+
+    public function reject(Article $article, User $actor, string $reason): Article
+    {
+        $reason = $this->cleanReason($reason);
+
+        return $this->transition($article, $actor, 'reject', ArticleStatus::REJECTED, fn () => [
+            'action' => ReviewAction::REJECTED,
+            'reason' => $reason,
+            'set' => ['rejection_reason' => $reason],
+            'after' => fn (Article $a) => $this->notifications->notify(
+                $a->author,
+                NotificationType::ARTICLE_REJECTED,
+                sprintf('Your article "%s" was rejected: %s', $a->title, $reason),
+                $a,
+            ),
+        ]);
+    }
+
+    public function approve(Article $article, User $actor): Article
+    {
+        return $this->transition($article, $actor, 'approve', ArticleStatus::APPROVED, fn () => [
+            'action' => ReviewAction::APPROVED,
+            'after' => fn (Article $a) => $this->notifications->notify(
+                $a->author,
+                NotificationType::ARTICLE_APPROVED,
+                sprintf('Your article "%s" was approved.', $a->title),
+                $a,
+            ),
+        ]);
+    }
+
+    /** Publish immediately (DRAFT|UNDER_REVIEW|APPROVED|SCHEDULED -> PUBLISHED); cancels any pending schedule. */
+    public function publishNow(Article $article, User $actor): Article
+    {
+        return $this->transition($article, $actor, 'publish', ArticleStatus::PUBLISHED, fn (Article $a) => [
+            'action' => ReviewAction::PUBLISHED,
+            'set' => $this->publishedAttributes($a),
+            'after' => function (Article $a) {
+                $this->cancelPendingSchedules($a);
+                $this->notifications->notify(
+                    $a->author,
+                    NotificationType::ARTICLE_PUBLISHED,
+                    sprintf('Your article "%s" was published.', $a->title),
+                    $a,
+                );
+                $this->queueSubscriberFanOut($a);
+            },
+        ]);
+    }
+
+    /** Schedule (or reschedule) for a FUTURE moment; exactly one PENDING PublishingSchedule per article. */
+    public function schedule(Article $article, User $actor, CarbonInterface $at): Article
+    {
+        if ($at->lessThanOrEqualTo(now())) {
+            throw ValidationException::withMessages(['scheduled_for' => ['scheduled_for must be a future date/time.']]);
+        }
+        if (! DateRange::fits($at)) { // DATETIME range (year <= 9999 in the app zone): otherwise a strict-mode insert error
+            throw ValidationException::withMessages(['scheduled_for' => [DateRange::MESSAGE]]);
+        }
+        // Same instant, app-zone wall clock (see ArticleWorkflowController::scheduledFor()).
+        $at = $at->copy()->setTimezone(config('app.timezone'));
+        $iso = $at->copy()->setTimezone(config('app.timezone'))->toIso8601String();
+
+        return $this->transition($article, $actor, 'schedule', ArticleStatus::SCHEDULED, function (Article $a, ArticleStatus $from) use ($actor, $at, $iso) {
+            $reschedule = $from === ArticleStatus::SCHEDULED;
+
+            return [
+                'action' => $reschedule ? ReviewAction::RESCHEDULED : ReviewAction::SCHEDULED,
+                'reason' => 'Scheduled for '.$iso,
+                'set' => ['scheduled_publish_at' => $at],
+                'after' => function (Article $a) use ($actor, $at, $iso, $reschedule) {
+                    $pending = PublishingSchedule::query()
+                        ->where('article_id', $a->id)->where('status', PublishingSchedule::PENDING)
+                        ->lockForUpdate()->first();
+                    if ($pending) {
+                        $pending->update(['scheduled_for' => $at, 'scheduled_by_id' => $actor->id]);
+                    } else {
+                        PublishingSchedule::query()->create([
+                            'article_id' => $a->id, 'scheduled_for' => $at,
+                            'scheduled_by_id' => $actor->id, 'status' => PublishingSchedule::PENDING,
+                        ]);
+                    }
+                    $this->notifications->notify(
+                        $a->author,
+                        NotificationType::ARTICLE_SCHEDULED,
+                        sprintf('Your article "%s" was %s to publish at %s.', $a->title, $reschedule ? 'rescheduled' : 'scheduled', $iso),
+                        $a,
+                    );
+                },
+            ];
+        });
+    }
+
+    /** SCHEDULED -> APPROVED without publishing. */
+    public function cancelSchedule(Article $article, User $actor): Article
+    {
+        return $this->transition($article, $actor, 'cancelSchedule', ArticleStatus::APPROVED, function (Article $a, ArticleStatus $from) {
+            // The map alone would let SUBMITTED/UNDER_REVIEW -> APPROVED through here (Django bug): only a schedule can be cancelled.
+            if ($from !== ArticleStatus::SCHEDULED) {
+                throw WorkflowException::field('status', sprintf('Cannot change status from %s to APPROVED. Only a SCHEDULED article has a schedule to cancel.', $from->value));
+            }
+
+            return [
+                'action' => ReviewAction::SCHEDULE_CANCELLED,
+                'set' => ['scheduled_publish_at' => null],
+                'after' => function (Article $a) {
+                    $this->cancelPendingSchedules($a);
+                    $this->notifications->notify(
+                        $a->author,
+                        NotificationType::ARTICLE_SCHEDULE_CANCELLED,
+                        sprintf('The scheduled publish for your article "%s" was cancelled.', $a->title),
+                        $a,
+                    );
+                },
+            ];
+        });
+    }
+
+    /**
+     * Admin: route an article to a reporter for review/edit (DRAFT|SUBMITTED|UNDER_REVIEW -> UNDER_REVIEW).
+     * The reporter must hold a ReporterCategoryAssignment for the article's category and must not be its author.
+     */
+    public function assignReporter(Article $article, User $actor, User $reporter): Article
+    {
+        return $this->transition($article, $actor, 'assignReporter', ArticleStatus::UNDER_REVIEW, function (Article $a, ArticleStatus $from) use ($reporter) {
+            if ($reporter->role?->value !== 'REPORTER') {
+                throw WorkflowException::field('reporter', 'The assigned user must be a Reporter (role=REPORTER).');
+            }
+            if (! $reporter->is_active) {
+                throw WorkflowException::field('reporter', "The assigned reporter's account is inactive.");
+            }
+            $allowedFrom = [ArticleStatus::DRAFT, ArticleStatus::SUBMITTED, ArticleStatus::UNDER_REVIEW];
+            if (! in_array($from, $allowedFrom, true)) {
+                throw WorkflowException::field(
+                    'status',
+                    sprintf('Cannot assign a reporter while the article is %s. Allowed from: %s.', $from->value, implode(', ', array_map(fn ($s) => $s->value, $allowedFrom))),
+                );
+            }
+            if ($reporter->id === $a->author_id) {
+                throw WorkflowException::field('reporter', "The assigned reporter cannot be the article's author.");
+            }
+            $a->loadMissing('subcategory.category', 'legacyCategory');
+            $category = $a->effective_category;
+            if ($category === null) {
+                throw WorkflowException::field('reporter', 'This article has no Category/Subcategory yet - classify it before assigning a reporter.');
+            }
+            $eligible = ReporterCategoryAssignment::query()
+                ->where('reporter_id', $reporter->id)->where('category_id', $category->id)->exists();
+            if (! $eligible) {
+                throw WorkflowException::field('reporter', sprintf(
+                    "%s is not assigned to the '%s' category this article belongs to. Assign them to that category first (Reporter Category Assignment) or choose a different reporter.",
+                    $reporter->email,
+                    $category->name,
+                ));
+            }
+
+            return [
+                'action' => ReviewAction::STARTED_REVIEW,
+                'reason' => ($from === ArticleStatus::UNDER_REVIEW ? 'Reassigned' : 'Assigned').' to reporter '.$reporter->email.' for review.',
+                'set' => ['assigned_reporter_id' => $reporter->id],
+                'after' => fn (Article $a) => $this->notifications->notify(
+                    $reporter,
+                    NotificationType::ARTICLE_ASSIGNED_FOR_REVIEW,
+                    sprintf('You were assigned to review/edit "%s".', $a->title),
+                    $a,
+                ),
+            ];
+        });
+    }
+
+    // ------------------------------------------------------------------
+    // Generic entry point (admin PATCH {status})
+    // ------------------------------------------------------------------
+
+    /**
+     * Move to $to through the matching named action. Context keys: reason (CHANGES_REQUESTED/REJECTED),
+     * scheduled_for (SCHEDULED; CarbonInterface|string). Re-sending the current status is a no-op (Django).
+     */
+    public function changeStatus(Article $article, User $actor, ArticleStatus $to, array $context = []): Article
+    {
+        $from = $article->status;
+        if ($from === $to) {
+            return $article;
+        }
+        if (! $from->canTransitionTo($to)) {
+            $this->assertAllowed($from, $to);
+        }
+
+        return match ($to) {
+            ArticleStatus::SUBMITTED => $this->submit($article, $actor),
+            ArticleStatus::UNDER_REVIEW => $this->startReview($article, $actor),
+            ArticleStatus::CHANGES_REQUESTED => $this->requestChanges($article, $actor, (string) ($context['reason'] ?? '')),
+            ArticleStatus::REJECTED => $this->reject($article, $actor, (string) ($context['reason'] ?? '')),
+            ArticleStatus::APPROVED => $from === ArticleStatus::SCHEDULED
+                ? $this->cancelSchedule($article, $actor)
+                : $this->approve($article, $actor),
+            ArticleStatus::SCHEDULED => $this->schedule($article, $actor, $this->parseSchedule($context['scheduled_for'] ?? null)),
+            ArticleStatus::PUBLISHED => $this->publishNow($article, $actor),
+            default => throw WorkflowException::field('status', 'Unsupported status change.'),
+        };
+    }
+
+    // ------------------------------------------------------------------
+    // Automatic publishing (no human actor)
+    // ------------------------------------------------------------------
+
+    /**
+     * Publish one due schedule. Idempotent and safe under concurrent workers: the article row is locked first
+     * (same order as the manual actions), then the schedule row is re-read under lock and re-validated.
+     * Returns true only when this call actually published the article.
+     */
+    public function publishDueSchedule(int $scheduleId, ?CarbonInterface $now = null): bool
+    {
+        $now ??= now();
+        $articleId = PublishingSchedule::query()->whereKey($scheduleId)->value('article_id');
+        if ($articleId === null) {
+            return false;
+        }
+
+        $published = DB::transaction(function () use ($scheduleId, $articleId, $now) {
+            $article = Article::query()->whereKey($articleId)->lockForUpdate()->first();
+            // Pending + due are re-checked in SQL under the row lock (a concurrent reschedule/cancel/publish
+            // may have changed it since the batch query); comparing in the database keeps both sides in one clock.
+            $schedule = PublishingSchedule::query()->whereKey($scheduleId)
+                ->where('status', PublishingSchedule::PENDING)->where('scheduled_for', '<=', $now)
+                ->lockForUpdate()->first();
+            if (! $article || ! $schedule) {
+                return null; // already handled, cancelled, rescheduled to later - nothing to do
+            }
+            if ($article->status !== ArticleStatus::SCHEDULED) {
+                // Out of sync with the schedule row: reconcile it and move on (Django).
+                $schedule->update(['status' => PublishingSchedule::CANCELLED]);
+
+                return null;
+            }
+
+            $this->assertAllowed($article->status, ArticleStatus::PUBLISHED);
+            $article->forceFill(['status' => ArticleStatus::PUBLISHED] + $this->publishedAttributes($article))->save();
+            ArticleReview::query()->create([
+                'article_id' => $article->id,
+                'reviewer_id' => null,
+                'action' => ReviewAction::PUBLISHED,
+                'from_status' => ArticleStatus::SCHEDULED->value,
+                'to_status' => ArticleStatus::PUBLISHED->value,
+                'reason' => '',
+            ]);
+            $schedule->update(['status' => PublishingSchedule::EXECUTED, 'executed_at' => $now]);
+            $this->notifications->notify(
+                $article->author,
+                NotificationType::ARTICLE_PUBLISHED,
+                sprintf('Your article "%s" was automatically published as scheduled.', $article->title),
+                $article,
+            );
+            $this->queueSubscriberFanOut($article);
+
+            return $article;
+        }, 3); // deadlock (1213) / lock-wait (1205) retry; lock order is always article -> schedule
+
+        return $published !== null;
+    }
+
+    /** Publish every PENDING schedule that is due; each in its own transaction. Returns how many were published. */
+    public function publishDueSchedules(?CarbonInterface $now = null): int
+    {
+        $now ??= now();
+        $count = 0;
+        $ids = PublishingSchedule::query()
+            ->where('status', PublishingSchedule::PENDING)->where('scheduled_for', '<=', $now)
+            ->orderBy('scheduled_for')->orderBy('id')->pluck('id');
+
+        foreach ($ids as $id) {
+            try {
+                $count += $this->publishDueSchedule((int) $id, $now) ? 1 : 0;
+            } catch (\Throwable $e) {
+                // Leave the schedule PENDING so the next tick retries it; never abort the batch.
+                report($e);
+            }
+        }
+
+        return $count;
+    }
+
+    // ------------------------------------------------------------------
+    // Internals
+    // ------------------------------------------------------------------
+
+    /**
+     * The one and only place that writes articles.status for user-driven actions.
+     *
+     * @param  Closure(Article, ArticleStatus): array{action: ReviewAction, reason?: string, set?: array<string,mixed>, after?: Closure}  $plan
+     */
+    private function transition(Article $article, User $actor, string $ability, ArticleStatus $to, Closure $plan): Article
+    {
+        $locked = DB::transaction(function () use ($article, $actor, $ability, $to, $plan) {
+            /** @var Article $a */
+            $a = Article::query()->whereKey($article->getKey())->lockForUpdate()->firstOrFail();
+            $this->authorize($actor, $a, $ability);
+
+            $from = $a->status;
+            $step = $plan($a, $from) + ['reason' => '', 'set' => [], 'after' => null];
+            $this->assertAllowed($from, $to);
+
+            // author_id is deliberately absent: the author never changes.
+            $a->forceFill(['status' => $to] + $step['set'])->save();
+            ArticleReview::query()->create([
+                'article_id' => $a->id,
+                'reviewer_id' => $actor->id,
+                'action' => $step['action'],
+                'from_status' => $from->value,
+                'to_status' => $to->value,
+                'reason' => $step['reason'],
+            ]);
+            if ($step['after']) {
+                ($step['after'])($a);
+            }
+
+            return $a;
+        }, 3); // deadlock (1213) / lock-wait (1205) retry; the article row is always locked first
+
+        $locked->load(ArticleResource::relations());
+        $article->setRawAttributes($locked->getAttributes(), true);
+        $article->setRelations($locked->getRelations());
+
+        return $locked;
+    }
+
+    /** @return array<string, mixed> */
+    private function publishedAttributes(Article $article): array
+    {
+        // published_at records the FIRST publication and is never overwritten (Django).
+        return ['published_at' => $article->published_at ?? now(), 'scheduled_publish_at' => null];
+    }
+
+    private function cancelPendingSchedules(Article $article): void
+    {
+        PublishingSchedule::query()
+            ->where('article_id', $article->id)->where('status', PublishingSchedule::PENDING)
+            ->update(['status' => PublishingSchedule::CANCELLED]);
+    }
+
+    private function queueSubscriberFanOut(Article $article): void
+    {
+        if ($article->access_level !== AccessLevel::PUBLIC) {
+            NotifySubscribersOfArticle::dispatch($article->id)->afterCommit();
+        }
+    }
+
+    private function assertAllowed(ArticleStatus $from, ArticleStatus $to): void
+    {
+        if ($from->canTransitionTo($to)) {
+            return;
+        }
+        $allowed = ArticleStatus::transitions()[$from->value];
+        sort($allowed);
+        $list = $allowed ? "['".implode("', '", $allowed)."']" : 'none (terminal)';
+
+        throw WorkflowException::field(
+            'status',
+            sprintf('Cannot change status from %s to %s. Allowed next status(es) from %s: %s.', $from->value, $to->value, $from->value, $list),
+        );
+    }
+
+    private function cleanReason(string $reason): string
+    {
+        $reason = trim($reason);
+        if ($reason === '') {
+            throw ValidationException::withMessages(['reason' => ['This field may not be blank.']]);
+        }
+        if (mb_strlen($reason) > 2000) {
+            throw ValidationException::withMessages(['reason' => ['Ensure this field has no more than 2000 characters.']]);
+        }
+
+        return $reason;
+    }
+
+    private function parseSchedule(mixed $value): CarbonInterface
+    {
+        if ($value instanceof CarbonInterface) {
+            return $value;
+        }
+        try {
+            return Carbon::parse((string) $value, config('app.timezone'))->setTimezone(config('app.timezone'));
+        } catch (\Throwable) {
+            throw ValidationException::withMessages(['scheduled_for' => ['This field is required.']]);
+        }
+    }
+}

@@ -1,0 +1,153 @@
+<?php
+
+namespace Tests\Feature\Workflow;
+
+use App\Enums\ArticleStatus as S;
+use App\Models\Article;
+use App\Models\ReporterCategoryAssignment;
+use Database\Factories\CategoryFactory;
+use Database\Factories\SubcategoryFactory;
+use Illuminate\Foundation\Testing\RefreshDatabase;
+use Illuminate\Support\Facades\DB;
+use Illuminate\Support\Facades\Queue;
+use Tests\Concerns\WorkflowFixtures;
+use Tests\TestCase;
+
+/** /api/articles/mine/, /assigned/ and the reporter-facing view of the workflow. */
+class ReporterFlowTest extends TestCase
+{
+    use RefreshDatabase, WorkflowFixtures;
+
+    protected function setUp(): void
+    {
+        parent::setUp();
+        $this->setUpWorkflow();
+        Queue::fake();
+    }
+
+    public function test_mine_returns_only_own_articles_in_drf_envelope(): void
+    {
+        $mine = $this->article(S::DRAFT);
+        $mine2 = $this->article(S::SUBMITTED);
+        $this->article(S::DRAFT, ['author_id' => $this->otherReporter->id]);
+        $this->article(S::PUBLISHED, ['author_id' => $this->otherReporter->id, 'published_at' => now()]);
+
+        $r = $this->getAs($this->author, '/api/articles/mine/')->assertOk();
+        $r->assertJsonStructure(['count', 'next', 'previous', 'results' => [['id', 'title', 'slug', 'status', 'author', 'assigned_reporter', 'subcategory', 'category', 'industry', 'tags', 'content', 'is_locked']]]);
+        $this->assertSame(2, $r->json('count'));
+        $this->assertEqualsCanonicalizing([$mine->slug, $mine2->slug], array_column($r->json('results'), 'slug'));
+        $this->assertNull($r->json('next'));
+        $this->assertNull($r->json('previous'));
+        $this->getAs($this->author, '/api/articles/mine')->assertOk()->assertJsonPath('count', 2);
+    }
+
+    public function test_mine_requires_authentication(): void
+    {
+        $this->getAs(null, '/api/articles/mine/')->assertStatus(401);
+        $this->getAs(null, '/api/articles/assigned/')->assertStatus(401);
+    }
+
+    public function test_mine_for_a_plain_user_only_ever_shows_published(): void
+    {
+        $this->article(S::PUBLISHED, ['author_id' => $this->plainUser->id, 'published_at' => now()]);
+        $this->article(S::DRAFT, ['author_id' => $this->plainUser->id]);
+        $this->getAs($this->plainUser, '/api/articles/mine/')->assertOk()->assertJsonPath('count', 1);
+    }
+
+    public function test_assigned_returns_only_articles_assigned_to_me(): void
+    {
+        $a = $this->article(S::UNDER_REVIEW, ['assigned_reporter_id' => $this->assignee->id]);
+        $this->article(S::UNDER_REVIEW, ['assigned_reporter_id' => $this->otherReporter->id]);
+        $this->article(S::DRAFT);
+        $r = $this->getAs($this->assignee, '/api/articles/assigned/')->assertOk();
+        $this->assertSame([$a->slug], array_column($r->json('results'), 'slug'));
+        $this->assertSame($this->assignee->id, $r->json('results.0.assigned_reporter.id'));
+        $this->getAs($this->author, '/api/articles/assigned/')->assertOk()->assertJsonPath('count', 0);
+    }
+
+    public function test_filters_search_ordering_and_pagination(): void
+    {
+        $old = $this->article(S::DRAFT, ['title' => 'Alpha budget story', 'created_at' => now()->subDays(3)]);
+        $mid = $this->article(S::SUBMITTED, ['title' => 'Beta cricket story', 'excerpt' => 'about budget', 'created_at' => now()->subDays(2)]);
+        $new = $this->article(S::DRAFT, ['title' => 'Gamma story', 'content' => '<p>unrelated</p>', 'created_at' => now()->subDay()]);
+
+        $slugs = fn ($r) => array_column($r->json('results'), 'slug');
+        $this->assertSame([$new->slug, $mid->slug, $old->slug], $slugs($this->getAs($this->author, '/api/articles/mine/')));
+        $this->assertSame([$old->slug, $mid->slug, $new->slug], $slugs($this->getAs($this->author, '/api/articles/mine/?ordering=created_at')));
+        $this->assertSame([$new->slug, $old->slug], $slugs($this->getAs($this->author, '/api/articles/mine/?status=DRAFT')));
+        $this->assertSame([$mid->slug, $old->slug], $slugs($this->getAs($this->author, '/api/articles/mine/?search=budget')));
+        $this->assertSame([$old->slug], $slugs($this->getAs($this->author, '/api/articles/mine/?search=budget+alpha')));
+        $this->assertSame(3, $this->getAs($this->author, '/api/articles/mine/?ordering=bogus')->json('count'));
+        $this->assertSame(3, $this->getAs($this->author, '/api/articles/mine/?subcategory='.$this->subcategory->slug)->json('count'));
+        $this->assertSame(3, $this->getAs($this->author, '/api/articles/mine/?category='.$this->category->slug)->json('count'));
+        $this->assertSame(3, $this->getAs($this->author, '/api/articles/mine/?industry='.$this->category->industry->slug)->json('count'));
+        $this->assertSame(0, $this->getAs($this->author, '/api/articles/mine/?subcategory=nope')->json('count'));
+        $this->getAs($this->author, '/api/articles/mine/?status=WHATEVER')->assertStatus(400)->assertJsonStructure(['status']);
+    }
+
+    public function test_pagination_page_size_20_next_previous_and_invalid_page(): void
+    {
+        Article::factory()->count(25)->create(['author_id' => $this->author->id, 'subcategory_id' => $this->subcategory->id]);
+        $p1 = $this->getAs($this->author, '/api/articles/mine/')->assertOk();
+        $this->assertSame(25, $p1->json('count'));
+        $this->assertCount(20, $p1->json('results'));
+        $this->assertStringContainsString('page=2', $p1->json('next'));
+        $p2 = $this->getAs($this->author, '/api/articles/mine/?page=2')->assertOk();
+        $this->assertCount(5, $p2->json('results'));
+        $this->assertNull($p2->json('next'));
+        $this->assertNotNull($p2->json('previous'));
+        $this->getAs($this->author, '/api/articles/mine/?page=9')->assertStatus(404)->assertJsonPath('detail', 'Invalid page.');
+    }
+
+    public function test_list_queries_do_not_n_plus_one(): void
+    {
+        Article::factory()->count(12)->create(['author_id' => $this->author->id, 'subcategory_id' => $this->subcategory->id]);
+        $this->app['auth']->forgetGuards();
+        $this->actingAsUser($this->author);
+        DB::flushQueryLog();
+        DB::enableQueryLog();
+        $this->getJson('/api/articles/mine/')->assertOk();
+        $this->assertLessThan(25, count(DB::getQueryLog()));
+    }
+
+    // ---------------------------------------------------- reporter category assignment enforcement
+
+    public function test_assignment_requires_active_reporter_category_assignment_at_the_time(): void
+    {
+        $a = $this->article();
+        ReporterCategoryAssignment::where('reporter_id', $this->assignee->id)->delete();
+        $r = $this->act($this->admin, $a->slug, 'assign-reporter', ['reporter_id' => $this->assignee->id])->assertStatus(400);
+        $this->assertStringContainsString($this->category->name, $r->json('reporter'));
+        $this->assertStringContainsString('is not assigned to the', $r->json('reporter'));
+
+        ReporterCategoryAssignment::create(['reporter_id' => $this->assignee->id, 'category_id' => $this->category->id]);
+        $this->act($this->admin, $a->slug, 'assign-reporter', ['reporter_id' => $this->assignee->id])->assertOk();
+    }
+
+    public function test_reporter_assigned_to_another_category_cannot_be_assigned(): void
+    {
+        $sub2 = SubcategoryFactory::new()->create(['category_id' => CategoryFactory::new()->create()->id]);
+        $a = $this->article(S::DRAFT, ['subcategory_id' => $sub2->id]);
+        $this->act($this->admin, $a->slug, 'assign-reporter', ['reporter_id' => $this->assignee->id])->assertStatus(400)->assertJsonStructure(['reporter']);
+    }
+
+    public function test_inactive_reporter_cannot_be_assigned(): void
+    {
+        $this->assignee->forceFill(['is_active' => false])->save();
+        $a = $this->article();
+        $this->act($this->admin, $a->slug, 'assign-reporter', ['reporter_id' => $this->assignee->id])->assertStatus(400)->assertJsonStructure(['reporter']);
+    }
+
+    public function test_assigned_reporter_can_run_the_review_loop_and_author_is_notified(): void
+    {
+        $a = $this->article();
+        $this->act($this->admin, $a->slug, 'assign-reporter', ['reporter_id' => $this->assignee->id])->assertOk();
+        // the assignee sees it in /assigned and can open review history
+        $this->getAs($this->assignee, '/api/articles/assigned/')->assertJsonPath('count', 1);
+        $this->act($this->assignee, $a->slug, 'request-changes', ['reason' => 'x'])->assertStatus(403);
+        $this->act($this->assignee, $a->slug, 'approve')->assertOk()->assertJsonPath('status', 'APPROVED');
+        $this->act($this->assignee, $a->slug, 'schedule', ['scheduled_for' => now()->addHour()->toIso8601String()])->assertOk();
+        $this->act($this->assignee, $a->slug, 'cancel-schedule')->assertStatus(403);
+        $this->act($this->assignee, $a->slug, 'publish')->assertOk()->assertJsonPath('status', 'PUBLISHED');
+    }
+}
